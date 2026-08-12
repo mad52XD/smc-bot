@@ -31,10 +31,10 @@ TF_MAP = {
 def connect() -> bool:
     """Initialise MT5 connection. Returns True if successful."""
     if not mt5.initialize(
-        path     = config.MT5_PATH,
-        login    = config.MT5_LOGIN,
-        password = config.MT5_PASSWORD,
-        server   = config.MT5_SERVER,
+        path=config.MT5_PATH,
+        login=config.MT5_LOGIN,
+        password=config.MT5_PASSWORD,
+        server=config.MT5_SERVER,
     ):
         log.error(f"MT5 initialise failed: {mt5.last_error()}")
         return False
@@ -91,21 +91,23 @@ def fetch_bars(symbol: str, timeframe: str, count: int) -> pd.DataFrame:
 
     rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
     if rates is None or len(rates) == 0:
-        log.warning(f"No bars returned for {symbol} {timeframe}: {mt5.last_error()}")
+        log.warning(
+            f"No bars returned for {symbol} {timeframe}: {mt5.last_error()}")
         return pd.DataFrame()
 
     df = pd.DataFrame(rates)
 
     # MT5 bar timestamps are Unix seconds in broker server time (usually UTC+2/+3).
     # Use the cached offset detected once at connect() time.
-    df['time'] = pd.to_datetime(df['time'] - _broker_offset_seconds, unit='s', utc=True)
+    df['time'] = pd.to_datetime(
+        df['time'] - _broker_offset_seconds, unit='s', utc=True)
     df = df.set_index('time').rename(columns={
         'open':      'open',
         'high':      'high',
         'low':       'low',
         'close':     'close',
         'tick_volume': 'volume',
-    })[['open','high','low','close','volume']]
+    })[['open', 'high', 'low', 'close', 'volume']]
 
     return df
 
@@ -159,10 +161,11 @@ def calculate_lot_size(symbol: str, risk_usd: float, sl_distance_price: float) -
     # For crypto CFDs: tick_value = contract_size × tick_size × quote_currency_rate
     # MT5 provides trade_tick_value directly
     tick_value = info.trade_tick_value   # USD per tick per lot
-    tick_size  = info.point              # minimum price movement
+    tick_size = info.point              # minimum price movement
 
     if tick_value == 0 or tick_size == 0 or sl_distance_price == 0:
-        log.warning(f"Cannot calculate lot size: tick_value={tick_value}, sl_dist={sl_distance_price}")
+        log.warning(
+            f"Cannot calculate lot size: tick_value={tick_value}, sl_dist={sl_distance_price}")
         return 0.0
 
     # How many ticks is our SL distance?
@@ -203,7 +206,8 @@ def place_market_order(
     Returns dict with 'success', 'ticket', 'price', 'error'.
     """
     if config.DRY_RUN:
-        log.info(f"[DRY RUN] {direction.upper()} {lots} lots {symbol} SL={sl_price:.4f} TP={tp_price:.4f}")
+        log.info(
+            f"[DRY RUN] {direction.upper()} {lots} lots {symbol} SL={sl_price:.4f} TP={tp_price:.4f}")
         return {"success": True, "ticket": -1, "price": 0.0, "error": None, "dry_run": True}
 
     info = mt5.symbol_info(symbol)
@@ -216,7 +220,7 @@ def place_market_order(
         return {"success": False, "ticket": None, "price": 0, "error": "No tick data"}
 
     order_type = mt5.ORDER_TYPE_BUY if direction == 'long' else mt5.ORDER_TYPE_SELL
-    price      = tick.ask if direction == 'long' else tick.bid
+    price = tick.ask if direction == 'long' else tick.bid
 
     # Normalise SL/TP to symbol digits
     digits = info.digits
@@ -246,7 +250,8 @@ def place_market_order(
         return {"success": False, "ticket": None, "price": price, "error": err}
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        log.error(f"Order failed: retcode={result.retcode} comment={result.comment}")
+        log.error(
+            f"Order failed: retcode={result.retcode} comment={result.comment}")
         return {"success": False, "ticket": None, "price": price, "error": result.comment}
 
     log.info(f"Order filled: ticket={result.order} price={result.price:.4f}")
@@ -314,3 +319,41 @@ def close_position(symbol: str, ticket: int) -> bool:
     }
     result = mt5.order_send(request)
     return result is not None and result.retcode == mt5.TRADE_RETCODE_DONE
+
+
+def get_closed_trade(ticket: int) -> dict:
+    """
+    Fetch a closed trade from MT5 history by ticket number.
+    Returns dict with close price, profit, close time and reason.
+    Returns None if not found.
+    """
+    from datetime import datetime, timezone, timedelta
+    import MetaTrader5 as mt5
+
+    # Search last 30 days of history
+    date_from = datetime.now(timezone.utc) - timedelta(days=30)
+    date_to = datetime.now(timezone.utc)
+
+    deals = mt5.history_deals_get(date_from, date_to)
+    if deals is None:
+        return None
+
+    # Find the deal that closed this ticket
+    for deal in deals:
+        if deal.position_id == ticket and deal.entry == 1:  # entry=1 means exit
+            # Determine close reason
+            if deal.reason == mt5.DEAL_REASON_SL:
+                close_reason = "SL"
+            elif deal.reason == mt5.DEAL_REASON_TP:
+                close_reason = "TP"
+            else:
+                close_reason = "MANUAL"
+
+            return {
+                "close_price":  deal.price,
+                "profit_usd":   deal.profit,
+                "close_time":   datetime.fromtimestamp(deal.time, tz=timezone.utc).isoformat(),
+                "close_reason": close_reason,
+                "volume":       deal.volume,
+            }
+    return None

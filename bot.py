@@ -46,10 +46,12 @@ log = logging.getLogger("bot")
 # ── Trade log ─────────────────────────────────────────────────────────────────
 def log_trade(event: str, data: dict):
     """Append a row to the CSV trade log."""
-    row = {"timestamp": datetime.now(timezone.utc).isoformat(), "event": event, **data}
+    row = {"timestamp": datetime.now(
+        timezone.utc).isoformat(), "event": event, **data}
     df_row = pd.DataFrame([row])
     log_path = config.LOG_FILE
-    df_row.to_csv(log_path, mode='a', header=not Path(log_path).exists(), index=False)
+    df_row.to_csv(log_path, mode='a', header=not Path(
+        log_path).exists(), index=False)
 
 
 # ── State persistence ─────────────────────────────────────────────────────────
@@ -72,6 +74,7 @@ def clear_state():
 
 # ── Time helpers ──────────────────────────────────────────────────────────────
 TF_MINUTES = {"M5": 5, "M15": 15, "M30": 30, "H1": 60}
+
 
 def seconds_to_next_bar(tf: str) -> float:
     """Seconds until the next bar closes."""
@@ -109,10 +112,10 @@ def get_htf_df() -> pd.DataFrame:
 class SMCBot:
 
     def __init__(self):
-        self.risk_mgr      = RiskManager(config.ACCOUNT_SIZE)
-        self.state         = load_state()
+        self.risk_mgr = RiskManager(config.ACCOUNT_SIZE)
+        self.state = load_state()
         self.last_bar_time = None
-        self.at_breakeven  = self.state.get('at_breakeven', False)
+        self.at_breakeven = self.state.get('at_breakeven', False)
 
         log.info("=" * 60)
         log.info("SMC Scenario B Bot starting")
@@ -129,18 +132,19 @@ class SMCBot:
 
     def arm_pending(self, direction: str, signals: dict):
         self.state = {
-            'pending'          : True,
-            'direction'        : direction,
-            'signal_bar'       : str(signals['bar_time']),
-            'signal_bar_count' : 0,
-            'ref_fvg_bottom'   : signals['last_bull_fvg_bottom'] if direction == 'long'
-                                 else signals['last_bear_fvg_top'],
-            'ref_fvg_top'      : signals['last_bull_fvg_top'] if direction == 'long'
-                                 else signals['last_bear_fvg_top'],
-            'at_breakeven'     : False,
+            'pending': True,
+            'direction': direction,
+            'signal_bar': str(signals['bar_time']),
+            'signal_bar_count': 0,
+            'ref_fvg_bottom': signals['last_bull_fvg_bottom'] if direction == 'long'
+            else signals['last_bear_fvg_top'],
+            'ref_fvg_top': signals['last_bull_fvg_top'] if direction == 'long'
+            else signals['last_bear_fvg_top'],
+            'at_breakeven': False,
         }
         save_state(self.state)
-        log.info(f"⏳ Pending {direction.upper()} armed at bar {signals['bar_time']}")
+        log.info(
+            f"⏳ Pending {direction.upper()} armed at bar {signals['bar_time']}")
         log_trade("SIGNAL_ARMED", {
             "direction": direction,
             "bar_time": str(signals['bar_time']),
@@ -160,7 +164,7 @@ class SMCBot:
 
         # ── Update daily drawdown tracker ─────────────────────────────────────
         balance = mt5b.get_account_balance()
-        equity  = mt5b.get_account_equity()
+        equity = mt5b.get_account_equity()
         self.risk_mgr.update_daily_start(balance, now_utc.date())
 
         # ── Compute indicators ────────────────────────────────────────────────
@@ -177,30 +181,64 @@ class SMCBot:
         )
 
         # ── Get open position ─────────────────────────────────────────────────
-        position     = mt5b.get_open_position(config.SYMBOL)
-        in_trade     = position is not None
+        position = mt5b.get_open_position(config.SYMBOL)
+        in_trade = position is not None
         open_tickets = 1 if in_trade else 0
 
+        # ── DETECT TRADE CLOSE ────────────────────────────────────────────────
+        # If we had a ticket in state but position is now closed → log the exit
+        saved_ticket = self.state.get('ticket')
+        if not in_trade and saved_ticket:
+            closed = mt5b.get_closed_trade(int(saved_ticket))
+            if closed:
+                # Calculate R realised
+                entry_price = self.state.get('entry_price', 0)
+                sl_price = self.state.get('sl_price', 0)
+                sl_dist = abs(
+                    entry_price - sl_price) if entry_price and sl_price else 0
+                r_realised = (closed['profit_usd'] / config.FIXED_RISK_USD
+                              if config.FIXED_RISK_USD > 0 else 0)
+                winner = closed['profit_usd'] > 0
+
+                log.info(
+                    f"{'✅ WIN' if winner else '❌ LOSS'} | "
+                    f"close={closed['close_price']:.4f} | "
+                    f"P&L=${closed['profit_usd']:.2f} | "
+                    f"R={r_realised:.2f} | "
+                    f"reason={closed['close_reason']}"
+                )
+                log_trade("EXIT", {
+                    "ticket":       saved_ticket,
+                    "close_price":  closed['close_price'],
+                    "close_reason": closed['close_reason'],
+                    "profit_usd":   closed['profit_usd'],
+                    "r_realised":   round(r_realised, 3),
+                    "winner":       winner,
+                    "close_time":   closed['close_time'],
+                })
+            # Clear state regardless
+            self.clear_pending()
         # ── MANAGE OPEN TRADE ─────────────────────────────────────────────────
         if in_trade:
-            direction  = 'long' if position.type == 0 else 'short'
-            entry_px   = position.price_open
+            direction = 'long' if position.type == 0 else 'short'
+            entry_px = position.price_open
             current_sl = position.sl
 
             # Breakeven check (Arjo page 20)
             at_be = self.state.get('at_breakeven', False)
             should_be = self.risk_mgr.should_move_to_breakeven(
-                direction     = direction,
-                entry_price   = entry_px,
-                sl_price      = current_sl,
-                new_bull_fvg  = signals['new_bull_fvg'],
-                new_bear_fvg  = signals['new_bear_fvg'],
-                last_bull_fvg_bottom = signals['last_bull_fvg_bottom'],
-                last_bear_fvg_top    = signals['last_bear_fvg_top'],
-                at_breakeven  = at_be,
+                direction=direction,
+                entry_price=entry_px,
+                sl_price=current_sl,
+                new_bull_fvg=signals['new_bull_fvg'],
+                new_bear_fvg=signals['new_bear_fvg'],
+                last_bull_fvg_bottom=signals['last_bull_fvg_bottom'],
+                last_bear_fvg_top=signals['last_bear_fvg_top'],
+                at_breakeven=at_be,
             )
             if should_be:
-                success = mt5b.modify_sl(config.SYMBOL, position.ticket, entry_px)
+                success = mt5b.modify_sl(
+                    config.SYMBOL, position.ticket, entry_px)
                 if success:
                     self.state['at_breakeven'] = True
                     save_state(self.state)
@@ -214,7 +252,8 @@ class SMCBot:
 
         # ── MANAGE PENDING SETUP ──────────────────────────────────────────────
         if self.pending:
-            self.state['signal_bar_count'] = self.state.get('signal_bar_count', 0) + 1
+            self.state['signal_bar_count'] = self.state.get(
+                'signal_bar_count', 0) + 1
             pending_bars = self.state['signal_bar_count']
 
             # Cancel if window expired
@@ -224,14 +263,14 @@ class SMCBot:
                 self.clear_pending()
                 return
 
-            direction   = self.state['direction']
-            ref_bottom  = self.state.get('ref_fvg_bottom', float('nan'))
-            ref_top     = self.state.get('ref_fvg_top', float('nan'))
+            direction = self.state['direction']
+            ref_bottom = self.state.get('ref_fvg_bottom', float('nan'))
+            ref_top = self.state.get('ref_fvg_top', float('nan'))
 
-            entered      = False
-            entry_price  = None
-            sl_price     = None
-            tp_price     = None
+            entered = False
+            entry_price = None
+            sl_price = None
+            tp_price = None
 
             # Scenario B: new FVG forming above reference
             if direction == 'long' and signals['new_bull_fvg']:
@@ -239,10 +278,10 @@ class SMCBot:
                 above_ref = np.isnan(ref_bottom) or fvg_bot > ref_bottom
                 if above_ref and not np.isnan(signals['last_bull_fvg_mid']):
                     entry_price = signals['last_bull_fvg_mid']
-                    sl_price    = (float(ref_bottom) - 0.5 * signals['atr']
-                                   if not np.isnan(ref_bottom)
-                                   else entry_price - config.SL_ATR_MULT * signals['atr'])
-                    tp_price    = self.risk_mgr.calculate_tp(
+                    sl_price = (float(ref_bottom) - 0.5 * signals['atr']
+                                if not np.isnan(ref_bottom)
+                                else entry_price - config.SL_ATR_MULT * signals['atr'])
+                    tp_price = self.risk_mgr.calculate_tp(
                         entry_price, sl_price, 'long', signals['swing_high'])
                     entered = True
 
@@ -251,24 +290,26 @@ class SMCBot:
                 below_ref = np.isnan(ref_top) or fvg_top < ref_top
                 if below_ref and not np.isnan(signals['last_bear_fvg_mid']):
                     entry_price = signals['last_bear_fvg_mid']
-                    sl_price    = (float(ref_top) + 0.5 * signals['atr']
-                                   if not np.isnan(ref_top)
-                                   else entry_price + config.SL_ATR_MULT * signals['atr'])
-                    tp_price    = self.risk_mgr.calculate_tp(
+                    sl_price = (float(ref_top) + 0.5 * signals['atr']
+                                if not np.isnan(ref_top)
+                                else entry_price + config.SL_ATR_MULT * signals['atr'])
+                    tp_price = self.risk_mgr.calculate_tp(
                         entry_price, sl_price, 'short', signals['swing_low'])
                     entered = True
 
             if entered:
                 # RR check
                 sl_dist = abs(entry_price - sl_price)
-                rr = abs(tp_price - entry_price) / sl_dist if sl_dist > 0 else 0
+                rr = abs(tp_price - entry_price) / \
+                    sl_dist if sl_dist > 0 else 0
                 if rr < config.MIN_RR:
                     log.info(f"RR {rr:.2f} < {config.MIN_RR} — skipping")
                     self.clear_pending()
                     return
 
                 # Risk check
-                can_trade, reason = self.risk_mgr.can_trade(balance, open_tickets)
+                can_trade, reason = self.risk_mgr.can_trade(
+                    balance, open_tickets)
                 if not can_trade:
                     log.warning(f"Risk check failed: {reason}")
                     self.clear_pending()
@@ -284,12 +325,12 @@ class SMCBot:
 
                 # Place order
                 result = mt5b.place_market_order(
-                    symbol    = config.SYMBOL,
-                    direction = direction,
-                    lots      = lots,
-                    sl_price  = sl_price,
-                    tp_price  = tp_price,
-                    comment   = f"SMC-B-{direction[0].upper()}",
+                    symbol=config.SYMBOL,
+                    direction=direction,
+                    lots=lots,
+                    sl_price=sl_price,
+                    tp_price=tp_price,
+                    comment=f"SMC-B-{direction[0].upper()}",
                 )
 
                 if result['success']:
@@ -300,24 +341,27 @@ class SMCBot:
                         f"SL={sl_price:.4f} TP={tp_price:.4f} RR={rr:.2f}"
                     )
                     log_trade("ENTRY", {
-                        "direction"   : direction,
-                        "entry_price" : entry_price,
-                        "sl"          : sl_price,
-                        "tp"          : tp_price,
-                        "lots"        : lots,
-                        "rr"          : round(rr, 3),
-                        "ticket"      : result['ticket'],
-                        "risk_usd"    : config.FIXED_RISK_USD,
-                        "balance"     : balance,
-                        "dry_run"     : config.DRY_RUN,
+                        "direction": direction,
+                        "entry_price": entry_price,
+                        "sl": sl_price,
+                        "tp": tp_price,
+                        "lots": lots,
+                        "rr": round(rr, 3),
+                        "ticket": result['ticket'],
+                        "risk_usd": config.FIXED_RISK_USD,
+                        "balance": balance,
+                        "dry_run": config.DRY_RUN,
                     })
                     # Update state with trade info
                     self.state['at_breakeven'] = False
-                    self.state['ticket']       = result['ticket']
+                    self.state['ticket'] = result['ticket']
+                    self.state['entry_price'] = entry_price
+                    self.state['sl_price'] = sl_price
                     save_state(self.state)
                 else:
                     log.error(f"Order failed: {result['error']}")
-                    log_trade("ORDER_FAILED", {"error": result['error'], "direction": direction})
+                    log_trade("ORDER_FAILED", {
+                              "error": result['error'], "direction": direction})
 
                 self.clear_pending()
             return
@@ -339,55 +383,58 @@ class SMCBot:
             log.critical("Cannot connect to MT5 — exiting")
             sys.exit(1)
 
-        log.info(f"Bot running. Waiting for {'DRY RUN ' if config.DRY_RUN else ''}bar closes...")
+        log.info(
+            f"Bot running. Waiting for {'DRY RUN ' if config.DRY_RUN else ''}bar closes...")
 
         processed_bar = None
-        stale_since   = None   # wall-clock time we first saw the current bar repeated
-        stale_warned  = False  # fire the warning only once per stale episode
+        stale_since = None   # wall-clock time we first saw the current bar repeated
+        stale_warned = False  # fire the warning only once per stale episode
 
         # Genuine stale = no new bar for 1.5× the bar period
-        tf_secs      = TF_MINUTES.get(config.TIMEFRAME, 5) * 60
+        tf_secs = TF_MINUTES.get(config.TIMEFRAME, 5) * 60
         stale_thresh = tf_secs * 1.5
 
         try:
             while True:
                 try:
-                        # Always fetch fresh data
-                        df = mt5b.fetch_bars(config.SYMBOL, config.TIMEFRAME, config.BAR_COUNT)
-                        if df.empty:
-                            log.warning("Empty bar data — skipping")
-                            time.sleep(config.POLL_INTERVAL_SEC)
-                            continue
+                    # Always fetch fresh data
+                    df = mt5b.fetch_bars(
+                        config.SYMBOL, config.TIMEFRAME, config.BAR_COUNT)
+                    if df.empty:
+                        log.warning("Empty bar data — skipping")
+                        time.sleep(config.POLL_INTERVAL_SEC)
+                        continue
 
-                        # Use the ACTUAL last closed bar time from the data
-                        # iloc[-1] = still-forming bar, iloc[-2] = last closed
-                        actual_bar_time = df.index[-2]
+                    # Use the ACTUAL last closed bar time from the data
+                    # iloc[-1] = still-forming bar, iloc[-2] = last closed
+                    actual_bar_time = df.index[-2]
 
-                        # Only process once per new closed bar
-                        if actual_bar_time != processed_bar:
-                            processed_bar = actual_bar_time
-                            stale_since   = None
-                            stale_warned  = False
-                            log.info(f"── New bar: {actual_bar_time} ──────────────────────────────")
+                    # Only process once per new closed bar
+                    if actual_bar_time != processed_bar:
+                        processed_bar = actual_bar_time
+                        stale_since = None
+                        stale_warned = False
+                        log.info(
+                            f"── New bar: {actual_bar_time} ──────────────────────────────")
 
-                            # Fetch 15M bars for HTF Hull
-                            df_htf = get_htf_df()
+                        # Fetch 15M bars for HTF Hull
+                        df_htf = get_htf_df()
 
-                            # Run strategy
-                            self.on_bar(df, df_htf)
-                        else:
-                            now = datetime.now(timezone.utc)
-                            if stale_since is None:
-                                stale_since = now
-                            stale_secs = (now - stale_since).total_seconds()
-                            if not stale_warned and stale_secs > stale_thresh:
-                                log.warning(
-                                    f"⚠️  MT5 data may be stalled — no new bar for "
-                                    f"{stale_secs:.0f}s (expected ≤{stale_thresh:.0f}s) "
-                                    f"last bar: {actual_bar_time}"
-                                )
-                                stale_warned = True
-                            # Do not call on_bar — wait for the next new bar
+                        # Run strategy
+                        self.on_bar(df, df_htf)
+                    else:
+                        now = datetime.now(timezone.utc)
+                        if stale_since is None:
+                            stale_since = now
+                        stale_secs = (now - stale_since).total_seconds()
+                        if not stale_warned and stale_secs > stale_thresh:
+                            log.warning(
+                                f"⚠️  MT5 data may be stalled — no new bar for "
+                                f"{stale_secs:.0f}s (expected ≤{stale_thresh:.0f}s) "
+                                f"last bar: {actual_bar_time}"
+                            )
+                            stale_warned = True
+                        # Do not call on_bar — wait for the next new bar
 
                 except Exception as e:
                     log.error(f"Error in on_bar: {e}", exc_info=True)
