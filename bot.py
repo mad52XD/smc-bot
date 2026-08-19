@@ -29,6 +29,8 @@ import strategy
 import mt5_bridge as mt5b
 from risk_manager import RiskManager
 
+import regime_filter
+
 # ── Logging setup ─────────────────────────────────────────────────────────────
 Path("logs").mkdir(exist_ok=True)
 
@@ -307,7 +309,30 @@ class SMCBot:
                     self.clear_pending()
                     return
 
-                # Risk check
+                # ── REGIME FILTER ─────────────────────────────────────────────
+                regime, risk_multiplier, confidence = regime_filter.get_regime(
+                    df)
+
+                if regime == "RANGING":
+                    log.info(
+                        f"🚫 RANGING regime detected (confidence={confidence:.2f}) "
+                        f"— blocking entry, waiting for new setup"
+                    )
+                    log_trade("REGIME_BLOCK", {
+                        "regime":     regime,
+                        "confidence": round(confidence, 3),
+                        "direction":  direction,
+                    })
+                    self.clear_pending()
+                    return
+
+                if regime == "VOLATILE":
+                    log.info(
+                        f"⚠️ VOLATILE regime detected (confidence={confidence:.2f}) "
+                        f"— reducing position size by 50%"
+                    )
+
+                # ── Risk check ────────────────────────────────────────────────
                 can_trade, reason = self.risk_mgr.can_trade(
                     balance, open_tickets)
                 if not can_trade:
@@ -318,27 +343,31 @@ class SMCBot:
                 # Calculate lot size
                 lots = self.risk_mgr.calculate_position_size(
                     entry_price, sl_price, mt5b.calculate_lot_size)
+                # apply regime multiplier
+                lots = round(lots * risk_multiplier, 2)
+
                 if lots <= 0:
                     log.error("Lot size calculation returned 0 — skipping")
                     self.clear_pending()
                     return
 
-                # Place order
+                # ── Place order ───────────────────────────────────────────────
                 result = mt5b.place_market_order(
                     symbol=config.SYMBOL,
                     direction=direction,
                     lots=lots,
                     sl_price=sl_price,
                     tp_price=tp_price,
-                    comment=f"SMC-B-{direction[0].upper()}",
+                    comment=f"SMC-B-{direction[0].upper()}-{regime[:3]}",
                 )
 
                 if result['success']:
                     log.info(
-                        f"✅ {'[DRY] ' if config.DRY_RUN else ''}"
+                        f"✅ {'[DRY] ' if config.DRY_RUN else '✅'}"
                         f"ENTRY {direction.upper()} "
                         f"lots={lots} entry≈{entry_price:.4f} "
-                        f"SL={sl_price:.4f} TP={tp_price:.4f} RR={rr:.2f}"
+                        f"SL={sl_price:.4f} TP={tp_price:.4f} "
+                        f"RR={rr:.2f} regime={regime}"
                     )
                     log_trade("ENTRY", {
                         "direction": direction,
@@ -349,6 +378,8 @@ class SMCBot:
                         "rr": round(rr, 3),
                         "ticket": result['ticket'],
                         "risk_usd": config.FIXED_RISK_USD,
+                        "regime": regime,
+                        "regime_conf": round(confidence, 3),
                         "balance": balance,
                         "dry_run": config.DRY_RUN,
                     })
@@ -361,7 +392,7 @@ class SMCBot:
                 else:
                     log.error(f"Order failed: {result['error']}")
                     log_trade("ORDER_FAILED", {
-                              "error": result['error'], "direction": direction})
+                              "error": result['error'], "direction": direction, "regime": regime})
 
                 self.clear_pending()
             return
